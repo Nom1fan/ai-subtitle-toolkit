@@ -4,12 +4,13 @@ Simple Windows app for extracting embedded English subtitles from video files an
 
 ## Download
 
-[Download v1.1.0](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.0/AiSubtitleToolkit-v1.1.0.zip)
+[Download v1.1.1](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.1/AiSubtitleToolkit-v1.1.1.zip)
 
 ## What It Does
 
 - Extracts embedded English text subtitles from video files to external `.eng.srt` files.
 - Uses `ffprobe` to inspect embedded subtitle streams.
+- Uses a faster SubRip extraction path for embedded SRT subtitle streams.
 - Uses `ffmpeg` to extract supported text subtitle streams.
 - Skips unsupported bitmap/image subtitle streams.
 - Translates subtitle files from Hebrew to English.

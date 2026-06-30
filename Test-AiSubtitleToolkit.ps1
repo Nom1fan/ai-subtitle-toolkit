@@ -133,6 +133,61 @@ function Invoke-ExtractWorkerExistingSubtitleTest {
     }
 }
 
+function Invoke-ExtractWorkerSubripSmokeTest {
+    $dir = New-TestJobDir
+    try {
+        $ffmpeg = Join-Path $PSScriptRoot 'ffmpeg.exe'
+        if (-not (Test-Path -LiteralPath $ffmpeg)) {
+            'SKIP extract worker SubRip smoke; ffmpeg.exe not found'
+            return
+        }
+
+        $sourceSubtitle = Join-Path $dir 'source.srt'
+        $input = Join-Path $dir 'movie.mkv'
+        $log = Join-Path $dir 'log.txt'
+        $progress = Join-Path $dir 'progress.txt'
+        $result = Join-Path $dir 'result.txt'
+        $done = Join-Path $dir 'done.txt'
+
+        [System.IO.File]::WriteAllText(
+            $sourceSubtitle,
+            "1`r`n00:00:00,100 --> 00:00:01,500`r`nHello from embedded subtitles.`r`n`r`n2`r`n00:00:01,600 --> 00:00:02,000`r`nSecond line.`r`n",
+            [System.Text.Encoding]::UTF8
+        )
+
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $ffmpeg -y -hide_banner -loglevel error -f lavfi -i color=c=black:s=320x240:d=3 -i $sourceSubtitle -c:v libx264 -t 3 -c:s srt $input 2>&1 | Out-Null
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        Assert-True ($LASTEXITCODE -eq 0) 'failed to create SubRip smoke MKV'
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath `
+            -ExtractWorkerMode `
+            -InputPath $input `
+            -LogFile $log `
+            -ProgressFile $progress `
+            -ResultFile $result `
+            -DoneFile $done | Out-Null
+
+        Assert-True ($LASTEXITCODE -eq 0) 'SubRip extract worker exited non-zero'
+        Assert-True ((Get-Content -Raw -LiteralPath $done).StartsWith('OK')) 'SubRip extract worker did not report OK'
+        Assert-True ((Get-Content -Raw -LiteralPath $progress).Trim() -eq '100') 'SubRip extract worker did not reach 100 progress'
+
+        $output = (Get-Content -Raw -LiteralPath $result).Trim()
+        Assert-True (Test-Path -LiteralPath $output) 'SubRip extract output missing'
+        $outputText = Get-Content -Raw -LiteralPath $output
+        Assert-True ($outputText -match 'Hello from embedded subtitles') 'SubRip extract output missing first subtitle'
+        Assert-True ($outputText -match 'Second line') 'SubRip extract output missing second subtitle'
+        Assert-True ((Get-Content -Raw -LiteralPath $log) -match 'Extracting embedded SubRip packets with ffprobe') 'SubRip fast path was not used'
+        'PASS extract worker SubRip smoke'
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Assert-TextHasLatin {
     param([string]$Text, [string]$Name)
     Assert-True (([regex]::Matches($Text, '[A-Za-z]')).Count -ge 3) $Name
@@ -226,6 +281,7 @@ Invoke-SelfTest
 Invoke-MockWorkerSuccessTest
 Invoke-MockWorkerCancelTest
 Invoke-ExtractWorkerExistingSubtitleTest
+Invoke-ExtractWorkerSubripSmokeTest
 if ($Wet) {
     Invoke-WetTests
 }

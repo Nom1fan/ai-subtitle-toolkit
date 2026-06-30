@@ -565,6 +565,98 @@ function Invoke-NativeTool {
     }
 }
 
+function Convert-SecondsToSrtTimestamp {
+    param($Seconds)
+
+    $secondsValue = [double]::Parse([string]$Seconds, [System.Globalization.CultureInfo]::InvariantCulture)
+    $milliseconds = [double][Math]::Round([Math]::Max([double]0, $secondsValue) * [double]1000)
+    $timeSpan = [System.TimeSpan]::FromMilliseconds($milliseconds)
+    return '{0:00}:{1:00}:{2:00},{3:000}' -f [Math]::Floor($timeSpan.TotalHours), $timeSpan.Minutes, $timeSpan.Seconds, $timeSpan.Milliseconds
+}
+
+function Convert-FfprobePacketDataToText {
+    param([string]$Data)
+
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    foreach ($line in ($Data -split "`n")) {
+        if ($line -match '^[0-9a-fA-F]{8}:\s+(.+?)(?:\s{2,}.*)?$') {
+            $hex = ($matches[1] -replace '[^0-9a-fA-F]', '')
+            for ($i = 0; $i + 1 -lt $hex.Length; $i += 2) {
+                $bytes.Add([Convert]::ToByte($hex.Substring($i, 2), 16))
+            }
+        }
+    }
+
+    if ($bytes.Count -eq 0) {
+        return ''
+    }
+
+    return [System.Text.Encoding]::UTF8.GetString($bytes.ToArray()).Trim()
+}
+
+function Extract-SubripSubtitleWithFfprobe {
+    param(
+        [string]$VideoPath,
+        [int]$SubtitleOrdinal,
+        [string]$OutputPath,
+        [scriptblock]$Log
+    )
+
+    $ffprobe = Resolve-ToolPath 'ffprobe'
+    & $Log 'Extracting embedded SubRip packets with ffprobe...'
+    $packetResult = Invoke-NativeTool -FilePath $ffprobe -Arguments @(
+        '-v', 'error',
+        '-select_streams', "s:$SubtitleOrdinal",
+        '-show_packets',
+        '-show_data',
+        '-show_entries', 'packet=pts_time,duration_time,data',
+        '-of', 'json',
+        $VideoPath
+    )
+
+    if ($packetResult.ExitCode -ne 0) {
+        $packetError = (($packetResult.Output | Select-Object -Last 10) -join "`n").Trim()
+        if (-not $packetError) {
+            $packetError = 'ffprobe failed while extracting subtitle packets.'
+        }
+        throw $packetError
+    }
+
+    $packetJson = ($packetResult.Output -join "`n") | ConvertFrom-Json
+    $packets = @($packetJson.packets)
+    if ($packets.Count -eq 0) {
+        throw 'No subtitle packets were found in the selected SubRip stream.'
+    }
+
+    $blocks = New-Object System.Collections.Generic.List[string]
+    $index = 1
+    foreach ($packet in $packets) {
+        $text = Convert-FfprobePacketDataToText ([string]$packet.data)
+        if (-not $text) {
+            continue
+        }
+
+        $startSeconds = [double]::Parse([string]$packet.pts_time, [System.Globalization.CultureInfo]::InvariantCulture)
+        $durationSeconds = 0
+        if ($packet.duration_time) {
+            $durationSeconds = [double]::Parse([string]$packet.duration_time, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $endSeconds = $startSeconds + [Math]::Max(0.1, $durationSeconds)
+
+        $start = Convert-SecondsToSrtTimestamp $startSeconds
+        $end = Convert-SecondsToSrtTimestamp $endSeconds
+        $blocks.Add("$index`n$start --> $end`n$text")
+        $index++
+    }
+
+    if ($blocks.Count -eq 0) {
+        throw 'No text subtitle packets were found in the selected SubRip stream.'
+    }
+
+    [System.IO.File]::WriteAllText($OutputPath, (($blocks -join "`n`n") + "`n"), (New-Object System.Text.UTF8Encoding($true)))
+    & $Log "Extracted $($blocks.Count) subtitle blocks."
+}
+
 function Extract-EnglishSubtitleFromVideo {
     param(
         [string]$VideoPath,
@@ -613,6 +705,14 @@ function Extract-EnglishSubtitleFromVideo {
         throw 'No extractable text subtitle streams were found. Bitmap/image subtitles are not supported.'
     }
 
+    $subtitleOrdinal = 0
+    for ($i = 0; $i -lt $streams.Count; $i++) {
+        if ([int]$streams[$i].index -eq [int]$stream.index) {
+            $subtitleOrdinal = $i
+            break
+        }
+    }
+
     $codec = [string]$stream.codec_name
     $language = ''
     if ($stream.tags) {
@@ -628,6 +728,12 @@ function Extract-EnglishSubtitleFromVideo {
     }
 
     & $Log "Extracting subtitle stream $($stream.index) ($codec, $language) to $outputPath..."
+    if ($codec -eq 'subrip') {
+        Extract-SubripSubtitleWithFfprobe -VideoPath $VideoPath -SubtitleOrdinal $subtitleOrdinal -OutputPath $tempOutputPath -Log $Log
+        Move-Item -LiteralPath $tempOutputPath -Destination $outputPath -Force
+        return $outputPath
+    }
+
     $extractResult = Invoke-NativeTool -FilePath $ffmpeg -Arguments @(
         '-nostdin',
         '-y',
@@ -1003,6 +1109,8 @@ function Invoke-SelfTests {
         )
         $selectedStream = Get-EnglishTextSubtitleStream $streams
         Assert-Equal $selectedStream.index 4 'English text stream selection'
+        Assert-Equal (Convert-SecondsToSrtTimestamp '3661.234') '01:01:01,234' 'SRT timestamp formatting'
+        Assert-Equal (Convert-FfprobePacketDataToText "`n00000000: 4865 6c6c 6f2e                           Hello.`n") 'Hello.' 'ffprobe packet hex decoding'
 
         $knownAsL = -join @(
             [char]0x05D9, [char]0x05D3, [char]0x05D5, [char]0x05E2,
