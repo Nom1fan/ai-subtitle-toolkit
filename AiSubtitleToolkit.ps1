@@ -792,6 +792,71 @@ function Resolve-SubtitleInputPath {
     throw 'Please select an .srt subtitle file or a supported video file.'
 }
 
+function Invoke-TranslationTextsWithFallback {
+    param(
+        [string[]]$Texts,
+        [string]$ApiKey,
+        [string]$Direction,
+        [scriptblock]$Log,
+        [scriptblock]$Translate = $null,
+        [int]$RetryDelaySeconds = 2
+    )
+
+    if (-not $Translate) {
+        $Translate = {
+            param([string[]]$Texts, [string]$ApiKey, [string]$Direction)
+            Invoke-GeminiTranslation -Texts $Texts -ApiKey $ApiKey -Direction $Direction
+        }
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $translatedTexts = @(& $Translate -Texts $Texts -ApiKey $ApiKey -Direction $Direction)
+            if ($translatedTexts.Count -eq $Texts.Count) {
+                Write-Output -NoEnumerate $translatedTexts
+                return
+            }
+
+            throw "Gemini returned $($translatedTexts.Count) strings for $($Texts.Count) input subtitles."
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 3) {
+                & $Log "Attempt $attempt failed. Retrying..."
+                if ($RetryDelaySeconds -gt 0) {
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                }
+            }
+        }
+    }
+
+    if ($Texts.Count -le 1) {
+        throw $lastError
+    }
+
+    $leftCount = [Math]::Floor($Texts.Count / 2)
+    $rightStart = $leftCount
+    & $Log "Gemini returned the wrong number of subtitles. Splitting this chunk into $leftCount and $($Texts.Count - $rightStart)."
+
+    $left = Invoke-TranslationTextsWithFallback `
+        -Texts @($Texts[0..($leftCount - 1)]) `
+        -ApiKey $ApiKey `
+        -Direction $Direction `
+        -Log $Log `
+        -Translate $Translate `
+        -RetryDelaySeconds $RetryDelaySeconds
+
+    $right = Invoke-TranslationTextsWithFallback `
+        -Texts @($Texts[$rightStart..($Texts.Count - 1)]) `
+        -ApiKey $ApiKey `
+        -Direction $Direction `
+        -Log $Log `
+        -Translate $Translate `
+        -RetryDelaySeconds $RetryDelaySeconds
+
+    Write-Output -NoEnumerate @($left + $right)
+}
+
 function Read-TextFileShared {
     param([string]$Path)
 
@@ -902,29 +967,14 @@ function Translate-SrtFile {
         & $SetProgress ([int](($current / [Math]::Max(1, $items.Count)) * 100))
         & $Log "Translating blocks $($current + 1)-$($end + 1)..."
 
-        $translatedTexts = $null
-        $lastError = $null
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-                $translatedTexts = Invoke-GeminiTranslation -Texts @($chunk | ForEach-Object { $_.Text }) -ApiKey $ApiKey -Direction $Direction
-                break
-            } catch {
-                $lastError = $_
-                & $Log "Attempt $attempt failed. Retrying..."
-                Start-Sleep -Seconds 2
-            }
-        }
-
-        if (-not $translatedTexts) {
-            throw $lastError
-        }
+        $translatedTexts = Invoke-TranslationTextsWithFallback `
+            -Texts @($chunk | ForEach-Object { $_.Text }) `
+            -ApiKey $ApiKey `
+            -Direction $Direction `
+            -Log $Log
 
         if (& $ShouldCancel) {
             throw 'Canceled by user.'
-        }
-
-        if ($translatedTexts.Count -ne $chunk.Count) {
-            throw "Gemini returned $($translatedTexts.Count) strings for $($chunk.Count) input subtitles."
         }
 
         for ($i = 0; $i -lt $chunk.Count; $i++) {
@@ -1180,6 +1230,26 @@ function Invoke-SelfTests {
         Assert-Equal $oneTranslation.Count 1 'Single Gemini translation count'
         Assert-Equal $oneTranslation[0] 'Tea' 'Single Gemini translation value'
 
+        $fallbackLogs = New-Object System.Collections.Generic.List[string]
+        $fallbackTranslator = {
+            param([string[]]$Texts, [string]$ApiKey, [string]$Direction)
+            if ($Texts.Count -gt 2) {
+                Write-Output -NoEnumerate @('too few')
+                return
+            }
+            Write-Output -NoEnumerate @($Texts | ForEach-Object { "translated $_" })
+        }
+        $fallbackTranslations = Invoke-TranslationTextsWithFallback `
+            -Texts @('one', 'two', 'three', 'four') `
+            -ApiKey 'test-key' `
+            -Direction 'English to Hebrew' `
+            -Log { param([string]$Message) $fallbackLogs.Add($Message) } `
+            -Translate $fallbackTranslator `
+            -RetryDelaySeconds 0
+        Assert-Equal $fallbackTranslations.Count 4 'Fallback translation count'
+        Assert-Equal $fallbackTranslations[2] 'translated three' 'Fallback translation order'
+        Assert-True (($fallbackLogs -join "`n") -match 'Splitting this chunk') 'Fallback split log'
+
         $resultPath = Join-Path $tmp 'result.txt'
         [System.IO.File]::WriteAllText($resultPath, 'C:\Temp\translated.eng.srt', [System.Text.Encoding]::UTF8)
         Assert-Equal (Read-WorkerResultFile $resultPath) 'C:\Temp\translated.eng.srt' 'Worker result reader'
@@ -1208,11 +1278,12 @@ function Invoke-SelfTests {
 function Show-CompletionDialog {
     param(
         [string]$OutputPath,
+        [string]$Title = 'Operation Complete',
         [System.Windows.Forms.IWin32Window]$Owner = $null
     )
 
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = 'Translation Complete'
+    $dialog.Text = $Title
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox = $false
@@ -1452,7 +1523,8 @@ function Show-MainForm {
     $startWorkerOperation = {
         param(
             [string[]]$WorkerArguments,
-            [string[]]$InitialLogLines
+            [string[]]$InitialLogLines,
+            [string]$CompletionTitle
         )
 
         $extractButton.Enabled = $false
@@ -1558,7 +1630,7 @@ function Show-MainForm {
                         & $setProgress 100
                         $output = Read-WorkerResultFile $script:currentResultFile
                         & $appendLog "Done: $output"
-                        Show-CompletionDialog -OutputPath $output -Owner $form
+                        Show-CompletionDialog -OutputPath $output -Title $CompletionTitle -Owner $form
                     } else {
                         $message = ($doneText -replace '^ERROR\s*', '').Trim()
                         if (-not $message) {
@@ -1641,7 +1713,8 @@ function Show-MainForm {
                 @(
                     "Input: $inputPath",
                     'Mode: extract embedded English subtitles only.'
-                )
+                ) `
+                'Extraction Complete'
         } catch {
             & $updateInputButtons
             $browseButton.Enabled = $true
@@ -1700,7 +1773,8 @@ function Show-MainForm {
                     "Input: $inputPath",
                     "Direction: $direction",
                     'Mode: translate subtitle file.'
-                )
+                ) `
+                'Translation Complete'
         } catch {
             & $updateInputButtons
             $browseButton.Enabled = $true
