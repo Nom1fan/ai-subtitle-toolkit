@@ -4,7 +4,7 @@ Simple Windows app for extracting embedded English subtitles from video files an
 
 ## Download
 
-[Download v1.1.2](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.2/AiSubtitleToolkit-v1.1.2.zip)
+[Download v1.1.3](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.3/AiSubtitleToolkit-v1.1.3.zip)
 
 ## What It Does
 

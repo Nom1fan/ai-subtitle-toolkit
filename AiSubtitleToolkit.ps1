@@ -372,7 +372,21 @@ function Invoke-GeminiTranslation {
     } | ConvertTo-Json -Depth 10
 
     $uri = "https://generativelanguage.googleapis.com/v1beta/models/$ModelName`:generateContent?key=$ApiKey"
-    $response = Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload))
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload))
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            } catch {
+            }
+        }
+        if ($statusCode -eq 429 -or $_.Exception.Message -match '429|Too Many Requests|quota|rate') {
+            throw 'Gemini rate limit or quota was hit. Wait a few minutes and try again.'
+        }
+        throw
+    }
     return Convert-GeminiResponseToStringArray -Response $response
 }
 
@@ -809,6 +823,7 @@ function Invoke-TranslationTextsWithFallback {
         }
     }
 
+    $wrongCountError = $null
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
@@ -821,6 +836,10 @@ function Invoke-TranslationTextsWithFallback {
             throw "Gemini returned $($translatedTexts.Count) strings for $($Texts.Count) input subtitles."
         } catch {
             $lastError = $_
+            $isWrongCount = $_.Exception.Message -match '^Gemini returned \d+ strings for \d+ input subtitles\.$'
+            if ($isWrongCount) {
+                $wrongCountError = $_
+            }
             if ($attempt -lt 3) {
                 & $Log "Attempt $attempt failed. Retrying..."
                 if ($RetryDelaySeconds -gt 0) {
@@ -830,8 +849,12 @@ function Invoke-TranslationTextsWithFallback {
         }
     }
 
-    if ($Texts.Count -le 1) {
+    if (-not $wrongCountError) {
         throw $lastError
+    }
+
+    if ($Texts.Count -le 1) {
+        throw $wrongCountError
     }
 
     $leftCount = [Math]::Floor($Texts.Count / 2)
@@ -1249,6 +1272,24 @@ function Invoke-SelfTests {
         Assert-Equal $fallbackTranslations.Count 4 'Fallback translation count'
         Assert-Equal $fallbackTranslations[2] 'translated three' 'Fallback translation order'
         Assert-True (($fallbackLogs -join "`n") -match 'Splitting this chunk') 'Fallback split log'
+
+        $rateLimitTranslator = {
+            param([string[]]$Texts, [string]$ApiKey, [string]$Direction)
+            $script:rateLimitCallsForSelfTest++
+            throw 'Gemini rate limit or quota was hit. Wait a few minutes and try again.'
+        }
+        $script:rateLimitCallsForSelfTest = 0
+        Assert-ThrowsLike {
+            Invoke-TranslationTextsWithFallback `
+                -Texts @('one', 'two', 'three', 'four') `
+                -ApiKey 'test-key' `
+                -Direction 'English to Hebrew' `
+                -Log { param([string]$Message) $fallbackLogs.Add($Message) } `
+                -Translate $rateLimitTranslator `
+                -RetryDelaySeconds 0
+        } 'rate limit' 'Rate limit does not split'
+        Assert-Equal $script:rateLimitCallsForSelfTest 3 'Rate limit retry count'
+        Remove-Variable -Name rateLimitCallsForSelfTest -Scope Script -ErrorAction SilentlyContinue
 
         $resultPath = Join-Path $tmp 'result.txt'
         [System.IO.File]::WriteAllText($resultPath, 'C:\Temp\translated.eng.srt', [System.Text.Encoding]::UTF8)
