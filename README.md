@@ -4,7 +4,7 @@ Simple Windows app for extracting embedded English subtitles from video files an
 
 ## Download
 
-[Download v1.1.3](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.3/AiSubtitleToolkit-v1.1.3.zip)
+[Download v1.1.4](https://github.com/Nom1fan/ai-subtitle-toolkit/releases/download/v1.1.4/AiSubtitleToolkit-v1.1.4.zip)
 
 ## What It Does
 
@@ -18,6 +18,7 @@ Simple Windows app for extracting embedded English subtitles from video files an
 - Keeps SRT timing and numbering intact.
 - Preserves common subtitle tags such as `<i>` and `{\\an8}`.
 - Saves the translated file next to the original subtitle.
+- Shows the app version in the window title.
 
 ## How To Run
 

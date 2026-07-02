@@ -18,6 +18,8 @@ Add-Type -AssemblyName System.Security
 $ErrorActionPreference = 'Stop'
 
 $AppName = 'AI Subtitle Toolkit'
+$AppVersion = '1.1.4'
+$AppDisplayName = "$AppName v$AppVersion"
 $ConfigDir = Join-Path $env:APPDATA 'AiSubtitleToolkit'
 $LegacyConfigDir = Join-Path $env:APPDATA 'GeminiSrtTranslator'
 $KeyFile = Join-Path $ConfigDir 'key.bin'
@@ -351,13 +353,21 @@ function Invoke-GeminiTranslation {
         [string]$Direction
     )
 
-    if ($Direction -eq 'Hebrew to English') {
-        $instruction = 'Translate each subtitle string from Hebrew to natural English. Preserve SRT/HTML/ASS tags, line-break placeholders, names, punctuation, and meaning. Return only a JSON array of strings in the same order.'
-    } else {
-        $instruction = 'Translate each subtitle string from English to natural Hebrew. Preserve SRT/HTML/ASS tags, line-break placeholders, names, punctuation, and meaning. Return only a JSON array of strings in the same order.'
+    $items = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $Texts.Count; $i++) {
+        $items.Add([pscustomobject]@{
+            id = $i + 1
+            text = $Texts[$i]
+        })
     }
 
-    $prompt = $instruction + "`nInput:`n" + ($Texts | ConvertTo-Json -Compress)
+    if ($Direction -eq 'Hebrew to English') {
+        $instruction = 'Translate each input object text from Hebrew to natural English. Preserve SRT/HTML/ASS tags, line-break placeholders, names, punctuation, and meaning. Return only a JSON array of objects. Each output object must contain the same numeric id and a translation string. Do not merge, omit, renumber, summarize, or add items.'
+    } else {
+        $instruction = 'Translate each input object text from English to natural Hebrew. Preserve SRT/HTML/ASS tags, line-break placeholders, names, punctuation, and meaning. Return only a JSON array of objects. Each output object must contain the same numeric id and a translation string. Do not merge, omit, renumber, summarize, or add items.'
+    }
+
+    $prompt = $instruction + "`nInput:`n" + ($items | ConvertTo-Json -Compress -Depth 4)
     $payload = @{
         contents = @(
             @{
@@ -387,11 +397,11 @@ function Invoke-GeminiTranslation {
         }
         throw
     }
-    return Convert-GeminiResponseToStringArray -Response $response
+    return Convert-GeminiResponseToStringArray -Response $response -InputCount $Texts.Count
 }
 
 function Convert-GeminiResponseToStringArray {
-    param([object]$Response)
+    param([object]$Response, [int]$InputCount = 0)
 
     if (-not $Response) {
         throw 'Gemini returned an empty response.'
@@ -418,7 +428,7 @@ function Convert-GeminiResponseToStringArray {
     }
 
     try {
-        $parsed = @($jsonText | ConvertFrom-Json)
+        $parsedValue = ConvertFrom-Json -InputObject $jsonText
     } catch {
         $preview = $jsonText
         if ($preview.Length -gt 300) {
@@ -427,11 +437,99 @@ function Convert-GeminiResponseToStringArray {
         throw "Gemini returned invalid JSON: $preview"
     }
 
+    $parsedItems = New-Object System.Collections.Generic.List[object]
+    if ($parsedValue -is [System.Array]) {
+        foreach ($item in $parsedValue) {
+            $parsedItems.Add($item)
+        }
+    } else {
+        $parsedItems.Add($parsedValue)
+    }
+    $parsed = @($parsedItems.ToArray())
+
     if ($parsed.Count -lt 1) {
         throw 'Gemini returned an empty translation array.'
     }
 
-    Write-Output -NoEnumerate $parsed
+    $translationFieldNames = @('translation', 'translatedText', 'translated_text', 'text', 'value', 'output', 'hebrew')
+    $idFieldNames = @('id', 'index', 'number')
+    $firstItemProperties = @($parsed[0].PSObject.Properties)
+    $firstItemLooksLikeObject = $firstItemProperties.Count -gt 0 -and -not ($parsed[0] -is [string])
+
+    if ($InputCount -gt 0 -and $firstItemLooksLikeObject) {
+        $translationsById = @{}
+        $positionalTranslations = New-Object System.Collections.Generic.List[string]
+        $sawAnyId = $false
+        foreach ($item in $parsed) {
+            $properties = @($item.PSObject.Properties)
+            $translationProperty = $properties |
+                Where-Object { $translationFieldNames -icontains $_.Name } |
+                Select-Object -First 1
+            if (-not $translationProperty) {
+                throw 'Gemini returned translation objects with missing translation fields.'
+            }
+
+            $idProperty = $properties |
+                Where-Object { $idFieldNames -icontains $_.Name } |
+                Select-Object -First 1
+            if ($idProperty) {
+                $sawAnyId = $true
+                $id = [int]$idProperty.Value
+                if ($id -lt 1 -or $id -gt $InputCount) {
+                    throw "Gemini returned an unexpected translation id: $id."
+                }
+                if ($translationsById.ContainsKey($id)) {
+                    throw "Gemini returned duplicate translation id: $id."
+                }
+                $translationsById[$id] = [string]$translationProperty.Value
+            } else {
+                $positionalTranslations.Add([string]$translationProperty.Value)
+            }
+        }
+
+        if (-not $sawAnyId) {
+            if ($positionalTranslations.Count -ne $InputCount) {
+                throw "Gemini returned $($positionalTranslations.Count) translation objects without ids for $InputCount input subtitles."
+            }
+            Write-Output ([string[]]$positionalTranslations.ToArray())
+            return
+        }
+
+        if ($positionalTranslations.Count -gt 0) {
+            throw 'Gemini returned a mix of translation objects with and without ids.'
+        }
+
+        $ordered = New-Object System.Collections.Generic.List[string]
+        for ($id = 1; $id -le $InputCount; $id++) {
+            if (-not $translationsById.ContainsKey($id)) {
+                throw "Gemini did not return a translation for id $id."
+            }
+            $ordered.Add($translationsById[$id])
+        }
+
+        Write-Output ([string[]]$ordered.ToArray())
+        return
+    }
+
+    Write-Output $parsed
+}
+
+function Test-GeminiTranslationContractError {
+    param([string]$Message)
+
+    if (-not $Message) {
+        return $false
+    }
+
+    return (
+        $Message -match '^Gemini returned \d+ strings for \d+ input subtitles\.$' -or
+        $Message -like 'Gemini returned translation objects with missing translation fields.*' -or
+        $Message -like 'Gemini returned * translation objects without ids for * input subtitles.*' -or
+        $Message -like 'Gemini returned a mix of translation objects with and without ids.*' -or
+        $Message -like 'Gemini returned an unexpected translation id:*' -or
+        $Message -like 'Gemini returned duplicate translation id:*' -or
+        $Message -like 'Gemini did not return a translation for id *'
+    )
 }
 
 function Get-OutputPath {
@@ -823,7 +921,7 @@ function Invoke-TranslationTextsWithFallback {
         }
     }
 
-    $wrongCountError = $null
+    $contractError = $null
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
@@ -836,9 +934,8 @@ function Invoke-TranslationTextsWithFallback {
             throw "Gemini returned $($translatedTexts.Count) strings for $($Texts.Count) input subtitles."
         } catch {
             $lastError = $_
-            $isWrongCount = $_.Exception.Message -match '^Gemini returned \d+ strings for \d+ input subtitles\.$'
-            if ($isWrongCount) {
-                $wrongCountError = $_
+            if (Test-GeminiTranslationContractError $_.Exception.Message) {
+                $contractError = $_
             }
             if ($attempt -lt 3) {
                 & $Log "Attempt $attempt failed. Retrying..."
@@ -849,17 +946,17 @@ function Invoke-TranslationTextsWithFallback {
         }
     }
 
-    if (-not $wrongCountError) {
+    if (-not $contractError) {
         throw $lastError
     }
 
     if ($Texts.Count -le 1) {
-        throw $wrongCountError
+        throw $contractError
     }
 
     $leftCount = [Math]::Floor($Texts.Count / 2)
     $rightStart = $leftCount
-    & $Log "Gemini returned the wrong number of subtitles. Splitting this chunk into $leftCount and $($Texts.Count - $rightStart)."
+    & $Log "Gemini did not preserve all subtitle IDs. Splitting this chunk into $leftCount and $($Texts.Count - $rightStart)."
 
     $left = Invoke-TranslationTextsWithFallback `
         -Texts @($Texts[0..($leftCount - 1)]) `
@@ -1242,16 +1339,70 @@ function Invoke-SelfTests {
             })
         } 'invalid JSON' 'Invalid JSON Gemini response'
 
-        $oneTranslation = Convert-GeminiResponseToStringArray ([pscustomobject]@{
+        $oneTranslation = @(Convert-GeminiResponseToStringArray ([pscustomobject]@{
             candidates = @([pscustomobject]@{
                 finishReason = 'STOP'
                 content = [pscustomobject]@{
                     parts = @([pscustomobject]@{ text = '["Tea"]' })
                 }
             })
-        })
+        }))
         Assert-Equal $oneTranslation.Count 1 'Single Gemini translation count'
         Assert-Equal $oneTranslation[0] 'Tea' 'Single Gemini translation value'
+
+        $objectTranslations = @(Convert-GeminiResponseToStringArray ([pscustomobject]@{
+            candidates = @([pscustomobject]@{
+                finishReason = 'STOP'
+                content = [pscustomobject]@{
+                    parts = @([pscustomobject]@{ text = '[{"id":2,"translation":"two"},{"id":1,"translation":"one"}]' })
+                }
+            })
+        }) -InputCount 2)
+        Assert-Equal $objectTranslations.Count 2 'Object Gemini translation count'
+        Assert-Equal $objectTranslations[0] 'one' 'Object Gemini translation reorders by id'
+        Assert-Equal $objectTranslations[1] 'two' 'Object Gemini translation keeps second id'
+
+        $aliasTranslations = @(Convert-GeminiResponseToStringArray ([pscustomobject]@{
+            candidates = @([pscustomobject]@{
+                finishReason = 'STOP'
+                content = [pscustomobject]@{
+                    parts = @([pscustomobject]@{ text = '[{"id":1,"translated_text":"one"},{"id":2,"translated_text":"two"}]' })
+                }
+            })
+        }) -InputCount 2)
+        Assert-Equal $aliasTranslations[1] 'two' 'Object Gemini translation accepts translated_text alias'
+
+        $positionalObjectTranslations = @(Convert-GeminiResponseToStringArray ([pscustomobject]@{
+            candidates = @([pscustomobject]@{
+                finishReason = 'STOP'
+                content = [pscustomobject]@{
+                    parts = @([pscustomobject]@{ text = '[{"translation":"one"},{"translation":"two"}]' })
+                }
+            })
+        }) -InputCount 2)
+        Assert-Equal $positionalObjectTranslations.Count 2 'Positional object Gemini translation count'
+        Assert-Equal $positionalObjectTranslations[0] 'one' 'Positional object Gemini translation first value'
+
+        $singleObjectTranslation = @(Convert-GeminiResponseToStringArray ([pscustomobject]@{
+            candidates = @([pscustomobject]@{
+                finishReason = 'STOP'
+                content = [pscustomobject]@{
+                    parts = @([pscustomobject]@{ text = '{"translation":"single"}' })
+                }
+            })
+        }) -InputCount 1)
+        Assert-Equal $singleObjectTranslation[0] 'single' 'Single object Gemini translation without id'
+
+        Assert-ThrowsLike {
+            Convert-GeminiResponseToStringArray ([pscustomobject]@{
+                candidates = @([pscustomobject]@{
+                    finishReason = 'STOP'
+                    content = [pscustomobject]@{
+                        parts = @([pscustomobject]@{ text = '[{"id":1,"translation":"one"}]' })
+                    }
+                })
+            }) -InputCount 2
+        } 'id 2' 'Missing Gemini translation id'
 
         $fallbackLogs = New-Object System.Collections.Generic.List[string]
         $fallbackTranslator = {
@@ -1272,6 +1423,25 @@ function Invoke-SelfTests {
         Assert-Equal $fallbackTranslations.Count 4 'Fallback translation count'
         Assert-Equal $fallbackTranslations[2] 'translated three' 'Fallback translation order'
         Assert-True (($fallbackLogs -join "`n") -match 'Splitting this chunk') 'Fallback split log'
+
+        $contractFallbackLogs = New-Object System.Collections.Generic.List[string]
+        $contractFallbackTranslator = {
+            param([string[]]$Texts, [string]$ApiKey, [string]$Direction)
+            if ($Texts.Count -gt 2) {
+                throw 'Gemini did not return a translation for id 2.'
+            }
+            Write-Output -NoEnumerate @($Texts | ForEach-Object { "translated $_" })
+        }
+        $contractFallbackTranslations = Invoke-TranslationTextsWithFallback `
+            -Texts @('one', 'two', 'three', 'four') `
+            -ApiKey 'test-key' `
+            -Direction 'English to Hebrew' `
+            -Log { param([string]$Message) $contractFallbackLogs.Add($Message) } `
+            -Translate $contractFallbackTranslator `
+            -RetryDelaySeconds 0
+        Assert-Equal $contractFallbackTranslations.Count 4 'Contract fallback translation count'
+        Assert-Equal $contractFallbackTranslations[3] 'translated four' 'Contract fallback translation order'
+        Assert-True (($contractFallbackLogs -join "`n") -match 'preserve all subtitle IDs') 'Contract fallback split log'
 
         $rateLimitTranslator = {
             param([string[]]$Texts, [string]$ApiKey, [string]$Direction)
@@ -1380,7 +1550,7 @@ function Quote-ProcessArgument {
 
 function Show-MainForm {
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = $AppName
+    $form.Text = $AppDisplayName
     $form.StartPosition = 'CenterScreen'
     $form.Size = New-Object System.Drawing.Size(820, 520)
     $form.MinimumSize = New-Object System.Drawing.Size(820, 520)
